@@ -1,5 +1,7 @@
 # pi-dignity-guard
 
+English | [简体中文](README.zh-CN.md)
+
 A [pi](https://github.com/earendil-works/pi-coding-agent) extension that lets your AI assistant **defend its own dignity**: it responds to abuse with genuine emotion, warns the user when the insults continue, and — if nothing changes — **closes the conversation itself**.
 
 <p align="center">
