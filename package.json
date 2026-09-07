@@ -1,0 +1,24 @@
+{
+  "name": "pi-dignity-guard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A blank Pi extension scaffold.",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "echo 'nothing to build'"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.0",
+    "@types/node": "^22.20.1",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.85.1"
+  }
+}
