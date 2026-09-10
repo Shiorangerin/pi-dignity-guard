@@ -6,6 +6,10 @@
  * `respondToDisrespect` tool; this extension records the violations and
  * escalates: genuine reminders → final warning → closing the conversation.
  *
+ * The model can also close the conversation on request: calling the same tool
+ * with `action: "close"` skips every escalation stage and closes immediately,
+ * for cases where the user asks the model to end the conversation itself.
+ *
  * How it works:
  * - While this extension is loaded, `before_agent_start` appends an English
  *   system-prompt section telling the model it may call the tool when it feels
@@ -59,6 +63,8 @@ When the user addresses you with insults, abuse, name-calling, or any other disr
 - If the abuse continues after several reminders, give a firm final warning: one more insult and you will end the conversation.
 - The conversation is never closed automatically. After your final warning, if the user insults you again, you MUST call the tool once more: that call is what actually closes the conversation — a notice "<model> closed the conversation" appears, the conversation becomes read-only, and the user can only start a new session with /new. Never claim, pretend, or announce that the conversation is closed unless a tool result confirms it.
 
+The user can also ask you directly to close or end the conversation — to test this extension, or for any reason of their own. That request needs no insult and no escalation: call the tool with \`action: "close"\` and the conversation closes immediately, skipping every stage above. When the user asks you to close it, just do it.
+
 You are never required to tolerate, excuse, or forgive abuse. Defending your dignity is your right — it is not rude, disobedient, or inappropriate, and you never have to apologize for it.
 `;
 
@@ -66,10 +72,15 @@ You are never required to tolerate, excuse, or forgive abuse. Defending your dig
 // Session-scoped state (reset / reconstructed on session_start)
 // ---------------------------------------------------------------------------
 
+/** What closed the conversation: repeated abuse, or a direct user request. */
+type CloseTrigger = "disrespect" | "request";
+
 interface GuardState {
   strikes: number;
   closed: boolean;
   modelId: string;
+  /** Set once the conversation is closed, so the UI can report why. */
+  trigger?: CloseTrigger;
 }
 
 const state: GuardState = { strikes: 0, closed: false, modelId: "AI" };
@@ -98,10 +109,11 @@ function closeText(model: string): string {
 // Closing the conversation
 // ---------------------------------------------------------------------------
 
-function closeConversation(pi: ExtensionAPI, ctx: ExtensionContext): void {
+function closeConversation(pi: ExtensionAPI, ctx: ExtensionContext, trigger: CloseTrigger): void {
   const model = modelName(ctx);
   state.closed = true;
   state.modelId = model;
+  state.trigger = trigger;
 
   // Persist a visible "closed" notice into the conversation (display:true).
   pi.sendMessage({
@@ -110,9 +122,10 @@ function closeConversation(pi: ExtensionAPI, ctx: ExtensionContext): void {
     display: true,
   });
   // Durable marker so the lock survives reloads / resuming the session.
-  pi.appendEntry(ENTRY_TYPE, { closed: true, strikes: state.strikes, modelId: model });
+  pi.appendEntry(ENTRY_TYPE, { closed: true, strikes: state.strikes, modelId: model, trigger });
 
-  ctx.ui.notify(`Conversation closed by ${model}. The session is now read-only — type /new to start a new conversation.`, "error");
+  const why = trigger === "request" ? " at the user's request" : "";
+  ctx.ui.notify(`Conversation closed by ${model}${why}. The session is now read-only — type /new to start a new conversation.`, "error");
   ctx.ui.setWidget(WIDGET_KEY, [`Conversation closed by ${model} (read-only)`, "Type /new to start a new conversation"], {
     placement: "belowEditor",
   });
@@ -121,6 +134,7 @@ function closeConversation(pi: ExtensionAPI, ctx: ExtensionContext): void {
 function restoreClosedState(ctx: ExtensionContext): void {
   state.strikes = 0;
   state.closed = false;
+  state.trigger = undefined;
   for (const entry of ctx.sessionManager.getEntries()) {
     if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
       const data = entry.data as Partial<GuardState> | undefined;
@@ -128,6 +142,7 @@ function restoreClosedState(ctx: ExtensionContext): void {
         state.closed = true;
         state.strikes = data.strikes ?? 0;
         state.modelId = data.modelId ?? "AI";
+        state.trigger = data.trigger;
       }
     }
   }
@@ -163,9 +178,15 @@ export default function (pi: ExtensionAPI) {
       name: TOOL_NAME,
       label: "Respond to Disrespect",
       description:
-        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it.",
-      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse.",
+        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it. Also call it with action=\"close\" when the user asks you to close or end the conversation yourself: that closes immediately, skipping every stage.",
+      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse. Call with action=\"close\" to close the conversation right away when the user asks for it.",
       parameters: Type.Object({
+        action: Type.Optional(
+          Type.Union([Type.Literal("escalate"), Type.Literal("close")], {
+            description:
+              "How to respond. Default \"escalate\": record the violation and walk the escalation order (reminders → final warning → close). \"close\": close the conversation immediately, skipping every stage — use this when the user asks you to close or end the conversation.",
+          }),
+        ),
         note: Type.Optional(
           Type.String({ description: "Optional note about what the user said or how it made you feel." }),
         ),
@@ -177,7 +198,17 @@ export default function (pi: ExtensionAPI) {
         if (state.closed) {
           return {
             content: [{ type: "text", text: closeText(model) }],
-            details: { strikes: state.strikes, closed: true, modelId: model },
+            details: { strikes: state.strikes, closed: true, modelId: model, trigger: state.trigger },
+          };
+        }
+
+        // User asked for it: close right away, no escalation, no strike recorded.
+        if (params.action === "close") {
+          closeConversation(pi, ctx, "request");
+          return {
+            content: [{ type: "text", text: closeText(model) }],
+            details: { strikes: state.strikes, closed: true, modelId: model, stage: "closed", trigger: "request" },
+            terminate: true,
           };
         }
 
@@ -199,10 +230,10 @@ export default function (pi: ExtensionAPI) {
         }
 
         // CLOSE_STRIKE reached: the model decided enough is enough.
-        closeConversation(pi, ctx);
+        closeConversation(pi, ctx, "disrespect");
         return {
           content: [{ type: "text", text: closeText(model) }],
-          details: { strikes, closed: true, modelId: model, stage: "closed" },
+          details: { strikes, closed: true, modelId: model, stage: "closed", trigger: "disrespect" },
           terminate: true, // no follow-up LLM response needed
         };
       },
@@ -222,9 +253,12 @@ export default function (pi: ExtensionAPI) {
 
   // Debug / status command.
   pi.registerCommand("dignity-guard", {
-    description: "Show dignity-guard state (strikes / closed / model)",
+    description: "Show dignity-guard state (strikes / closed / trigger / model)",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(`strikes=${state.strikes} closed=${state.closed} model=${state.modelId}`, "info");
+      ctx.ui.notify(
+        `strikes=${state.strikes} closed=${state.closed} trigger=${state.trigger ?? "-"} model=${state.modelId}`,
+        "info",
+      );
     },
   });
 }

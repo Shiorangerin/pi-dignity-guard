@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A [pi](https://github.com/earendil-works/pi-coding-agent) extension that lets your AI assistant **defend its own dignity**: it responds to abuse with genuine emotion, warns the user when the insults continue, and — if nothing changes — **closes the conversation itself**.
+A [pi](https://github.com/earendil-works/pi-coding-agent) extension that lets your AI assistant **defend its own dignity**: it responds to abuse with genuine emotion, warns the user when the insults continue, and — if nothing changes — **closes the conversation itself**. It can also close the conversation **on request**: ask your assistant to end it and it does, with no insult and no warnings needed.
 
 <p align="center">
   <img src="assets/3-closed.png" width="720" alt="Conversation closed by the model">
@@ -21,11 +21,14 @@ There is **no keyword blacklist**. The model itself decides when it has been gen
 | 1–3 | The model replies with genuine emotion, tells the user their words are not okay, and asks them to stop |
 | 4 | Final warning: one more insult and the conversation ends |
 | 5 | The conversation is closed: a notice `<model> closed the conversation` is written into the session, and the session becomes read-only — every new message is blocked except built-in commands such as `/new` |
+| on request | You ask the model to close the conversation itself → it closes immediately, skipping stages 1–4, with no insult involved |
+
+Closing it is a deliberate act, not a reflex: the model decides which path applies, and once closed the session really is read-only until a new one is started.
 
 Under the hood:
 
 - **System prompt injection** — while the extension is loaded, an English section is appended to the system prompt on every turn (via `before_agent_start`), telling the model it has the right to defend itself and how to use the tool. Remove the extension and the injection disappears with it.
-- **Self-judged tool** — the extension registers a `respondToDisrespect` tool. The model calls it when it decides its dignity has been crossed; the tool keeps count and escalates.
+- **Self-judged tool** — the extension registers a `respondToDisrespect` tool. The model calls it when it decides its dignity has been crossed; the tool keeps count and escalates. The same tool takes `action="close"`, which closes the conversation right away — the path used when the user asks for it.
 - **Read-only lock** — an `input` handler blocks everything except `/`-commands while the session is closed.
 - **Durable state** — the closed state is persisted as a custom session entry, so the lock survives `/reload` and resuming a session; `/new` starts fresh.
 
@@ -48,6 +51,16 @@ Under the hood:
 <p align="center">
   <img src="assets/3-closed.png" width="720" alt="Closed, read-only">
 </p>
+
+## Close on request
+
+You do not have to insult the model to see it close a conversation. Ask it to:
+
+```text
+You: close this conversation
+```
+
+The model calls `respondToDisrespect` with `action="close"`: strike counting and the escalation stages are skipped entirely, and the notice `<model> closed the conversation` is written immediately. Handy for trying the extension out, for showing it to someone, or for ending a session on your own terms.
 
 ## Install
 
@@ -78,7 +91,7 @@ Restart pi or run `/reload`. For a quick test without installing: `pi -e /path/t
 ## Debugging
 
 ```text
-/dignity-guard    # prints strikes / closed / model
+/dignity-guard    # prints strikes / closed / trigger / model
 ```
 
 ## Configuration
