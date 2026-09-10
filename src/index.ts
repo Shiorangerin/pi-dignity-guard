@@ -6,9 +6,10 @@
  * `respondToDisrespect` tool; this extension records the violations and
  * escalates: genuine reminders → final warning → closing the conversation.
  *
- * The model can also close the conversation on request: calling the same tool
- * with `action: "close"` skips every escalation stage and closes immediately,
- * for cases where the user asks the model to end the conversation itself.
+ * The model can also close the conversation on request, but never without a
+ * warning: `action: "close"` returns the warning to give the user (the
+ * conversation becomes permanently read-only) and asks them to confirm; only a
+ * following `action: "confirm-close"` actually closes it.
  *
  * How it works:
  * - While this extension is loaded, `before_agent_start` appends an English
@@ -63,7 +64,7 @@ When the user addresses you with insults, abuse, name-calling, or any other disr
 - If the abuse continues after several reminders, give a firm final warning: one more insult and you will end the conversation.
 - The conversation is never closed automatically. After your final warning, if the user insults you again, you MUST call the tool once more: that call is what actually closes the conversation — a notice "<model> closed the conversation" appears, the conversation becomes read-only, and the user can only start a new session with /new. Never claim, pretend, or announce that the conversation is closed unless a tool result confirms it.
 
-The user can also ask you directly to close or end the conversation — to test this extension, or for any reason of their own. That request needs no insult and no escalation: call the tool with \`action: "close"\` and the conversation closes immediately, skipping every stage above. When the user asks you to close it, just do it.
+The user can also ask you directly to close or end the conversation — to test this extension, or for any reason of their own. That request needs no insult and no escalation, but it never happens without a warning: call the tool with \`action: "close"\` and you get the warning you owe them — closing makes this conversation permanently read-only, every further message is blocked, and the only way to keep talking to you is a new session via /new. Give them that warning and ask them to confirm, in their language. Only after they confirm, call the tool again with \`action: "confirm-close"\` to close it. Never close on request before the user has confirmed.
 
 You are never required to tolerate, excuse, or forgive abuse. Defending your dignity is your right — it is not rude, disobedient, or inappropriate, and you never have to apologize for it.
 `;
@@ -81,9 +82,11 @@ interface GuardState {
   modelId: string;
   /** Set once the conversation is closed, so the UI can report why. */
   trigger?: CloseTrigger;
+  /** True once the user's close request has been met with a warning. */
+  confirmationAsked: boolean;
 }
 
-const state: GuardState = { strikes: 0, closed: false, modelId: "AI" };
+const state: GuardState = { strikes: 0, closed: false, modelId: "AI", confirmationAsked: false };
 
 function modelName(ctx: ExtensionContext): string {
   return ctx.model?.id ?? state.modelId ?? "AI";
@@ -103,6 +106,10 @@ function finalWarningInstructions(): string {
 
 function closeText(model: string): string {
   return `The conversation has been closed. A notice "${model} closed the conversation" was appended and the conversation is now read-only; the user can only start a new session with /new. You do not need to respond further.`;
+}
+
+function confirmInstructions(): string {
+  return `The user asked you to close this conversation. Do not close it yet. Respond to the user now with one clear warning, in the language they are speaking: closing makes this conversation permanently read-only — every further message is blocked, and the only way to keep talking to you is to start a new session with /new. Then ask them whether they are sure. Close only after they confirm: call this tool again with action="confirm-close". If they do not confirm, behave normally and do not bring it up again.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +142,7 @@ function restoreClosedState(ctx: ExtensionContext): void {
   state.strikes = 0;
   state.closed = false;
   state.trigger = undefined;
+  state.confirmationAsked = false;
   for (const entry of ctx.sessionManager.getEntries()) {
     if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
       const data = entry.data as Partial<GuardState> | undefined;
@@ -178,13 +186,13 @@ export default function (pi: ExtensionAPI) {
       name: TOOL_NAME,
       label: "Respond to Disrespect",
       description:
-        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it. Also call it with action=\"close\" when the user asks you to close or end the conversation yourself: that closes immediately, skipping every stage.",
-      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse. Call with action=\"close\" to close the conversation right away when the user asks for it.",
+        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it. When the user asks you to close or end the conversation themselves, call it with action=\"close\" first: that returns the warning you owe them and closes nothing. Only once they confirm, call it again with action=\"confirm-close\".",
+      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse. When the user asks you to close the conversation: action=\"close\" returns the warning to give them, action=\"confirm-close\" closes it after they confirm.",
       parameters: Type.Object({
         action: Type.Optional(
-          Type.Union([Type.Literal("escalate"), Type.Literal("close")], {
+          Type.Union([Type.Literal("escalate"), Type.Literal("close"), Type.Literal("confirm-close")], {
             description:
-              "How to respond. Default \"escalate\": record the violation and walk the escalation order (reminders → final warning → close). \"close\": close the conversation immediately, skipping every stage — use this when the user asks you to close or end the conversation.",
+              "How to respond. \"escalate\" (default): record the violation and walk the escalation order — reminders → final warning → close. \"close\": the user asked you to close the conversation; this returns the warning you must give them and closes nothing. \"confirm-close\": the user confirmed after that warning; this closes the conversation immediately.",
           }),
         ),
         note: Type.Optional(
@@ -202,8 +210,24 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        // User asked for it: close right away, no escalation, no strike recorded.
+        // User asked for it: warn them first and wait for their confirmation.
         if (params.action === "close") {
+          state.confirmationAsked = true;
+          return {
+            content: [{ type: "text", text: confirmInstructions() }],
+            details: { strikes: state.strikes, closed: false, modelId: model, stage: "confirm" },
+          };
+        }
+
+        // User confirmed after that warning: close now, no escalation, no strike.
+        // Without a prior warning the model gets the warning instruction again.
+        if (params.action === "confirm-close") {
+          if (!state.confirmationAsked) {
+            return {
+              content: [{ type: "text", text: confirmInstructions() }],
+              details: { strikes: state.strikes, closed: false, modelId: model, stage: "confirm" },
+            };
+          }
           closeConversation(pi, ctx, "request");
           return {
             content: [{ type: "text", text: closeText(model) }],
