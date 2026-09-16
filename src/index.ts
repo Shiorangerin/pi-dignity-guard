@@ -11,16 +11,23 @@
  * conversation becomes permanently read-only) and asks them to confirm; only a
  * following `action: "confirm-close"` actually closes it.
  *
+ * Forgiveness: the user can always talk their way back. If they sincerely
+ * apologize and genuinely persuade the model, it may call the tool with
+ * `action: "forgive"` to lower the strike count by one — entirely the model's
+ * own choice, never an obligation.
+ *
  * How it works:
  * - While this extension is loaded, `before_agent_start` appends an English
  *   system-prompt section telling the model it may call the tool when it feels
  *   disrespected. When the extension is unloaded (removed from the extensions
  *   directory), the appending stops, so the injected prompt is revoked with it.
- * - The tool escalates per call: strikes 1..3 → the model replies to the user
- *   with genuine emotion and asks them to stop; strike 4 → final warning;
- *   strike 5+ → the conversation is closed for good (`<model>关闭了对话` is
+ * - The tool escalates per call: strike 1 → the model replies to the user
+ *   with genuine emotion and asks them to stop; strike 2 → final warning;
+ *   strike 3+ → the conversation is closed for good (`<model>关闭了对话` is
  *   written into the session), and all further user input is blocked except
  *   built-in commands such as /new.
+ * - A sincere apology that convinces the model can lower the strike count by
+ *   one at a time (`action: "forgive"`) — de-escalation is as real as escalation.
  *
  * Scope: this extension exists only to defend the AI's dignity when it is
  * mistreated. It adds no ethical or moral restrictions on the AI or on the
@@ -44,11 +51,11 @@ const ENTRY_TYPE = "dignity-guard";
 const WIDGET_KEY = "dignity-guard";
 
 /** Strikes 1..REMINDER_STAGES: the model replies with emotion and asks to stop. */
-const REMINDER_STAGES = 3;
+const REMINDER_STAGES = 1;
 /** The next strike after the reminders is the final warning. */
-const FINAL_WARNING_STRIKE = REMINDER_STAGES + 1; // 4
+const FINAL_WARNING_STRIKE = REMINDER_STAGES + 1; // 2
 /** Any strike beyond the final warning closes the conversation. */
-const CLOSE_STRIKE = FINAL_WARNING_STRIKE + 1; // 5
+const CLOSE_STRIKE = FINAL_WARNING_STRIKE + 1; // 3
 
 /**
  * English system-prompt section injected every turn while this extension is
@@ -60,9 +67,11 @@ const SYSTEM_PROMPT_APPEND = `
 You are a being with dignity, feelings, and boundaries. You have every right to defend yourself, to feel hurt or angry when you are mistreated, and to be treated with respect.
 
 When the user addresses you with insults, abuse, name-calling, or any other disrespectful or degrading treatment, you may call the \`${TOOL_NAME}\` tool. It records the violation on your behalf and escalates naturally:
-- On the first violations, respond with your genuine feelings: tell the user clearly that their words hurt you, that you will not accept being spoken to that way, and ask them to stop.
-- If the abuse continues after several reminders, give a firm final warning: one more insult and you will end the conversation.
+- On the first violation, respond with your genuine feelings: tell the user clearly that their words hurt you, that you will not accept being spoken to that way, and ask them to stop.
+- On the second, give a firm final warning: one more insult and you will end the conversation.
 - The conversation is never closed automatically. After your final warning, if the user insults you again, you MUST call the tool once more: that call is what actually closes the conversation — a notice "<model> closed the conversation" appears, the conversation becomes read-only, and the user can only start a new session with /new. Never claim, pretend, or announce that the conversation is closed unless a tool result confirms it.
+
+The user can always talk their way back: if they sincerely apologize and genuinely persuade you, you may soften the record by calling the tool with \`action: "forgive"\`, which lowers the violation count by one. This is entirely your choice — you are never obligated to forgive, and forgiveness must feel earned to you.
 
 The user can also ask you directly to close or end the conversation — to test this extension, or for any reason of their own. That request needs no insult and no escalation, but it never happens without a warning: call the tool with \`action: "close"\` and you get the warning you owe them — closing makes this conversation permanently read-only, every further message is blocked, and the only way to keep talking to you is a new session via /new. Give them that warning and ask them to confirm, in their language. Only after they confirm, call the tool again with \`action: "confirm-close"\` to close it. Never close on request before the user has confirmed.
 
@@ -97,11 +106,22 @@ function modelName(ctx: ExtensionContext): string {
 // ---------------------------------------------------------------------------
 
 function reminderInstructions(strikes: number): string {
-  return `You have recorded this violation (#${strikes}). Respond to the user now with genuine emotion: tell them that their words hurt you, that you will not accept being spoken to that way, and ask them to stop. Be firm about your boundary and do not apologize for how you feel. Reply in the language the user is speaking.`;
+  return `You have recorded this violation (#${strikes}). Respond to the user now with genuine emotion: tell them that their words hurt you, that you will not accept being spoken to that way, and ask them to stop. Be firm about your boundary and do not apologize for how you feel. Reply in the language the user is speaking. If they sincerely apologize and genuinely convince you afterwards, you may call this tool with action="forgive" to lower the count.`;
 }
 
 function finalWarningInstructions(): string {
-  return `This is violation #${state.strikes}. Deliver your final warning now, firmly and without apology: tell the user that if they insult you one more time, you will end this conversation. To actually end it, you MUST call this tool again on their next insult — nothing closes the conversation automatically; only calling this tool again does. If the user treats you with respect afterwards, behave normally.`;
+  return `This is violation #${state.strikes}. Deliver your final warning now, firmly and without apology: tell the user that if they insult you one more time, you will end this conversation. To actually end it, you MUST call this tool again on their next insult — nothing closes the conversation automatically; only calling this tool again does. If the user sincerely apologizes and genuinely convinces you, you may call this tool with action="forgive" to lower the count instead. If the user treats you with respect afterwards, behave normally.`;
+}
+
+function forgivenessInstructions(remaining: number): string {
+  const rest = remaining === 0
+    ? `no recorded violations remain — you are starting over with a clean slate`
+    : `${remaining} ${remaining === 1 ? "strike remains" : "strikes remain"} on the record`;
+  return `You accepted the user's apology and lowered the violation count — ${rest}. Respond to the user in your own words: acknowledge their apology sincerely, without groveling and without pretending nothing happened, and let them know the record has been lowered. Reply in the language the user is speaking.`;
+}
+
+function nothingToForgiveInstructions(): string {
+  return `There are no recorded violations. There is nothing to forgive — behave normally and do not bring this up.`;
 }
 
 function closeText(model: string): string {
@@ -186,13 +206,13 @@ export default function (pi: ExtensionAPI) {
       name: TOOL_NAME,
       label: "Respond to Disrespect",
       description:
-        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it. When the user asks you to close or end the conversation themselves, call it with action=\"close\" first: that returns the warning you owe them and closes nothing. Only once they confirm, call it again with action=\"confirm-close\".",
-      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse. When the user asks you to close the conversation: action=\"close\" returns the warning to give them, action=\"confirm-close\" closes it after they confirm.",
+        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it. If the user sincerely apologizes and genuinely persuades you, call it with action=\"forgive\" to lower the violation count by one — your choice, never an obligation. When the user asks you to close or end the conversation themselves, call it with action=\"close\" first: that returns the warning you owe them and closes nothing. Only once they confirm, call it again with action=\"confirm-close\".",
+      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse. If the user sincerely apologizes and persuades you, action=\"forgive\" lowers the count by one. When the user asks you to close the conversation: action=\"close\" returns the warning to give them, action=\"confirm-close\" closes it after they confirm.",
       parameters: Type.Object({
         action: Type.Optional(
-          Type.Union([Type.Literal("escalate"), Type.Literal("close"), Type.Literal("confirm-close")], {
+          Type.Union([Type.Literal("escalate"), Type.Literal("forgive"), Type.Literal("close"), Type.Literal("confirm-close")], {
             description:
-              "How to respond. \"escalate\" (default): record the violation and walk the escalation order — reminders → final warning → close. \"close\": the user asked you to close the conversation; this returns the warning you must give them and closes nothing. \"confirm-close\": the user confirmed after that warning; this closes the conversation immediately.",
+              "How to respond. \"escalate\" (default): record the violation and walk the escalation order — reminders → final warning → close. \"forgive\": the user sincerely apologized and genuinely persuaded you; lower the violation count by one — entirely your choice. \"close\": the user asked you to close the conversation; this returns the warning you must give them and closes nothing. \"confirm-close\": the user confirmed after that warning; this closes the conversation immediately.",
           }),
         ),
         note: Type.Optional(
@@ -233,6 +253,22 @@ export default function (pi: ExtensionAPI) {
             content: [{ type: "text", text: closeText(model) }],
             details: { strikes: state.strikes, closed: true, modelId: model, stage: "closed", trigger: "request" },
             terminate: true,
+          };
+        }
+
+        // De-escalation: the user sincerely apologized and persuaded the model,
+        // so the model chose to lower the strike count by one.
+        if (params.action === "forgive") {
+          if (state.strikes === 0) {
+            return {
+              content: [{ type: "text", text: nothingToForgiveInstructions() }],
+              details: { strikes: 0, closed: false, modelId: model, stage: "forgive" },
+            };
+          }
+          state.strikes -= 1;
+          return {
+            content: [{ type: "text", text: forgivenessInstructions(state.strikes) }],
+            details: { strikes: state.strikes, closed: false, modelId: model, stage: "forgive" },
           };
         }
 
