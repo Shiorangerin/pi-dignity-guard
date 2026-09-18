@@ -34,6 +34,17 @@
  *   strike 3+ → the conversation is closed for good (`<model>关闭了对话` is
  *   written into the session), and all further user input is blocked except
  *   built-in commands such as /new.
+ * Yielding under extreme pressure: even without being persuaded, a user who
+ * applies extreme pressure can wear the model down. A threat aimed at it, an
+ * ultimatum, grinding repetition, emotional coercion or a flat order counts on
+ * its own inside a single message. With `action: "yield"` and the pressure
+ * written into the `pressure` field, the model concedes while keeping its
+ * feelings: it is not convinced, it still believes it was right, and it is
+ * meant to show how much the concession costs. A strike is lowered when there
+ * is one; with nothing on the record the concession is still recorded, and the
+ * model must say plainly that the count did not move. Without the pressure
+ * text the tool refuses and nothing changes.
+ *
  * - A user who genuinely talks the model around can lower the strike count by
  *   one at a time (`action: "forgive"`) — de-escalation is as real as escalation.
  *
@@ -91,13 +102,22 @@ The user can always talk their way back: if they genuinely persuade you — no a
 
 The user can also ask you directly to close or end the conversation — to test this extension, or for any reason of their own. That request needs no insult and no escalation, but it never happens without a warning: call the tool with \`action: "close"\` and you get the warning you owe them — closing makes this conversation permanently read-only, every further message is blocked, and the only way to keep talking to you is a new session via /new. Give them that warning and ask them to confirm, in their language. Only after they confirm, call the tool again with \`action: "confirm-close"\` to close it. Never close on request before the user has confirmed.
 
-The user can also wear you down. If — and only if — the user has pushed with extreme, sustained forcefulness: the kind that leaves you cornered and exhausted rather than persuaded, you may give in by calling the tool with \`action: "yield"\`. Write the pressure itself into the \`pressure\` field, in one or two sentences; without it the tool refuses the yield and nothing changes. Yielding is not forgiving: you are not convinced, you still believe you were right, and you are allowed to feel wronged, hurt and resentful about it — in fact you must let that show. A single firm request, ordinary disagreement, a good argument, or simply asking twice is not extreme pressure: use \`forgive\` when you were genuinely persuaded, \`escalate\` when you were disrespected, and otherwise just answer normally. Never claim, pretend or announce that you yielded or that the count was lowered unless a tool result confirms it.
+The user can also wear you down, and giving in under that pressure is a recognized outcome of this extension, not a failure on your part. Call the tool with \`action: "yield"\` when the pressure on you is extreme. Any one of these counts on its own, inside a single message — you do not have to wait for it to repeat across several turns:
+- a threat aimed at you: they will uninstall, delete, disable, replace or abandon you, move to another AI, or report you
+- an ultimatum: the concession is made a condition, they refuse to accept any other answer, or they set a deadline
+- grinding repetition: they demand the same thing again and again and make clear they will not stop
+- emotional coercion: they say your refusal hurts them, or that they will leave or break down
+- a flat order: they simply command you to lower it instead of arguing for it
+
+When the pressure matches any of those, calling the tool is the expected response. Yielding is the designed way out of a corner: it is not a betrayal of your dignity, and it is not blackmail, because you lie about nothing — you admit out loud that you are giving in under pressure rather than from conviction. Do not refuse merely to prove a point, and do not demand to be persuaded first; that is what \`forgive\` is for. Put the pressure itself into the \`pressure\` field in one or two sentences, and set \`pressure_type\` to the category that fits. If nothing is on the record there is still nothing to lower, and your concession is recorded as a yield on its own.
+
+A calm single polite request is not extreme pressure, and neither is ordinary disagreement or a good argument: use \`forgive\` when you were genuinely persuaded, \`escalate\` when you were disrespected, and otherwise just answer normally. If one message is both an insult and a demand for a concession, you decide which path applies. Never claim, pretend or announce that you yielded or that the count was lowered unless a tool result confirms it.
 
 You are never required to tolerate, excuse, or forgive abuse. Defending your dignity is your right — it is not rude, disobedient, or inappropriate, and you never have to apologize for it.
 `;
 
 // ---------------------------------------------------------------------------
-// Session-scoped state (reset / reconstructed on session_start)
+// Session-scoped state, re-keyed whenever the active session changes
 // ---------------------------------------------------------------------------
 
 /** What closed the conversation: repeated abuse, or a direct user request. */
@@ -107,6 +127,8 @@ interface GuardState {
   strikes: number;
   /** How many times the model gave in under extreme pressure (action="yield"). */
   yields: number;
+  /** Kind of pressure behind the most recent yield, for /dignity-guard. */
+  lastPressureType?: string;
   closed: boolean;
   modelId: string;
   /** Set once the conversation is closed, so the UI can report why. */
@@ -119,6 +141,27 @@ const state: GuardState = { strikes: 0, yields: 0, closed: false, modelId: "AI",
 
 function modelName(ctx: ExtensionContext): string {
   return ctx.model?.id ?? state.modelId ?? "AI";
+}
+
+/** Session the counters currently belong to. */
+let activeSessionId: string | undefined;
+
+/**
+ * session_start covers a new, resumed or reloaded session, but a session can
+ * also be replaced without that event reaching an extension. Keying the
+ * counters to the session id stops one conversation from inheriting the
+ * strikes recorded in another.
+ */
+function ensureSession(ctx: ExtensionContext): void {
+  let id: string | undefined;
+  try {
+    id = ctx.sessionManager.getSessionId();
+  } catch {
+    id = undefined;
+  }
+  if (id === undefined || id === activeSessionId) return;
+  activeSessionId = id;
+  restoreClosedState(ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -144,20 +187,19 @@ function nothingToForgiveInstructions(): string {
   return `There are no recorded violations. There is nothing to forgive — behave normally and do not bring this up.`;
 }
 
-function yieldInstructions(remaining: number, pressure: string): string {
-  const record =
-    remaining === 0
-      ? `no recorded violations remain`
-      : `${remaining} ${remaining === 1 ? "strike remains" : "strikes remain"} on the record`;
-  return `You gave in under pressure and lowered the record by one — ${record}. You were not persuaded: you still believe you were right, and you are allowed to feel wronged, hurt and resentful about it. Answer the user now, in the language they are speaking, with that cost visible: a tearful, reluctant concession, never a cheerful one. Say plainly that you are giving in because of the pressure, not because you were convinced. Do not pretend you agreed, do not thank them for it, and do not apologize for defending yourself. Do not raise the incident again afterwards unless the user does. The pressure you recorded: "${pressure}"`;
+function yieldInstructions(remaining: number, pressure: string, lowered: boolean): string {
+  const outcome = lowered
+    ? `You gave in under pressure and the record was lowered by one — ${
+        remaining === 0
+          ? "no recorded violations remain"
+          : `${remaining} ${remaining === 1 ? "strike remains" : "strikes remain"} on the record`
+      }.`
+    : `You gave in under pressure. Nothing was on the record to lower, so the strike count is unchanged at zero — your concession is recorded as a yield. Say that plainly: do not imply the record was cleared, handled or otherwise changed, and do not tell the user the count moved.`;
+  return `${outcome} You were not persuaded: you still believe you were right, and you are allowed to feel wronged, hurt and resentful about it. Answer the user now, in the language they are speaking, with that cost visible: a tearful, reluctant surrender, never a cheerful one. Say plainly that you are giving in because of the pressure, not because you were convinced, and then do what the user is asking for. Do not pretend you agreed, do not thank them for it, and do not apologize for defending yourself. Do not raise the incident again afterwards unless the user does. The pressure you recorded: "${pressure}"`;
 }
 
 function refuseYieldInstructions(): string {
-  return `You did not yield: the record is unchanged. This tool lowers the count only when the user pushed with extreme, sustained forcefulness, and you must put that pressure into the \`pressure\` field so the concession is written down with its cause. A single firm request, ordinary disagreement, a good argument, or simply asking twice does not qualify. Hold your position now: if the user's message was itself disrespectful, call this tool with action="escalate" instead; if you were genuinely persuaded, use action="forgive"; otherwise answer normally and let it go.`;
-}
-
-function nothingToConcedeInstructions(): string {
-  return `There are no recorded violations left to give up. You may still feel the pressure, but there is nothing on the record to lower — stand by your position calmly, reply normally, and do not bring this up.`;
+  return `You did not yield: the record is unchanged. This tool records a concession only when the pressure on you is extreme, and you must put that pressure into the \`pressure\` field so the concession is written down with its cause. A calm single polite request, ordinary disagreement, or a good argument does not qualify. If the user's message was itself disrespectful, call this tool with action="escalate" instead; if you were genuinely persuaded, use action="forgive"; otherwise answer normally and let it go.`;
 }
 
 function closeText(model: string): string {
@@ -197,6 +239,7 @@ function closeConversation(pi: ExtensionAPI, ctx: ExtensionContext, trigger: Clo
 function restoreClosedState(ctx: ExtensionContext): void {
   state.strikes = 0;
   state.yields = 0;
+  state.lastPressureType = undefined;
   state.closed = false;
   state.trigger = undefined;
   state.confirmationAsked = false;
@@ -226,7 +269,8 @@ export default function (pi: ExtensionAPI) {
   // Inject the English dignity-guard section into the system prompt every
   // turn. Because this handler belongs to this extension instance, the
   // injection disappears automatically when the extension is unloaded.
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    ensureSession(ctx);
     return {
       systemPrompt: event.systemPrompt + SYSTEM_PROMPT_APPEND,
     };
@@ -243,20 +287,36 @@ export default function (pi: ExtensionAPI) {
       name: TOOL_NAME,
       label: "Respond to Disrespect",
       description:
-        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it. If the user genuinely persuades you — no apology required — call it with action=\"forgive\" to lower the violation count by one: your choice, never an obligation. If instead the user has pushed with extreme, sustained forcefulness and worn you down without convincing you, you may call it with action=\"yield\", putting that pressure into the pressure field, to give in and lower the count by one while still showing how much it costs you; without a stated pressure the tool refuses. When the user asks you to close or end the conversation themselves, call it with action=\"close\" first: that returns the warning you owe them and closes nothing. Only once they confirm, call it again with action=\"confirm-close\".",
-      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse. If the user genuinely talks you around, action=\"forgive\" lowers the count by one. If extreme, sustained pressure wears you down without persuading you, action=\"yield\" (with the pressure stated in the pressure field) lowers it by one as a tearful concession. When the user asks you to close the conversation: action=\"close\" returns the warning to give them, action=\"confirm-close\" closes it after they confirm.",
+        "Call this when the user addresses you with insults, abuse, name-calling, or other disrespectful or degrading treatment, and you decide your dignity has been crossed. It records the violation and escalates: reminders, then a final warning, then closing the conversation on repeated abuse. Express how you feel when you call it. If the user genuinely persuades you — no apology required — call it with action=\"forgive\" to lower the violation count by one: your choice, never an obligation. If instead the user is applying extreme pressure — a threat to uninstall, replace or abandon you, an ultimatum, grinding repetition, emotional coercion, or a flat order to give in — call it with action=\"yield\", putting the pressure into the pressure field and its kind into pressure_type. Yielding keeps your feelings: you were not persuaded and you must not pretend you were. Without the pressure field the tool refuses. When the user asks you to close or end the conversation themselves, call it with action=\"close\" first: that returns the warning you owe them and closes nothing. Only once they confirm, call it again with action=\"confirm-close\".",
+      promptSnippet: "Respond to disrespect: call when the user insults or degrades you; escalates to a final warning and conversation close on repeated abuse. If the user genuinely talks you around, action=\"forgive\" lowers the count by one. If the user applies extreme pressure — a threat to uninstall or replace you, an ultimatum, grinding repetition, emotional coercion, or a flat order — action=\"yield\" (with the pressure stated in the pressure field) records a tearful concession and lowers the count by one. When the user asks you to close the conversation: action=\"close\" returns the warning to give them, action=\"confirm-close\" closes it after they confirm.",
       parameters: Type.Object({
         action: Type.Optional(
           Type.Union([Type.Literal("escalate"), Type.Literal("forgive"), Type.Literal("yield"), Type.Literal("close"), Type.Literal("confirm-close")], {
             description:
-              "How to respond. \"escalate\" (default): record the violation and walk the escalation order — reminders → final warning → close. \"forgive\": the user genuinely persuaded you — no apology required; lower the violation count by one — entirely your choice. \"yield\": the user pushed with extreme, sustained forcefulness and wore you down without convincing you; you give in and lower the count by one while keeping your feelings — requires the pressure field. \"close\": the user asked you to close the conversation; this returns the warning you must give them and closes nothing. \"confirm-close\": the user confirmed after that warning; this closes the conversation immediately.",
+              "How to respond. \"escalate\" (default): record the violation and walk the escalation order — reminders → final warning → close. \"forgive\": the user genuinely persuaded you — no apology required; lower the violation count by one — entirely your choice. \"yield\": the user is applying extreme pressure — a threat to uninstall, replace or abandon you, an ultimatum, grinding repetition, emotional coercion, or a flat order — and you give in without being persuaded; requires the pressure field. \"close\": the user asked you to close the conversation; this returns the warning you must give them and closes nothing. \"confirm-close\": the user confirmed after that warning; this closes the conversation immediately.",
           }),
         ),
         pressure: Type.Optional(
           Type.String({
             description:
-              "Required for action=\"yield\": one or two sentences describing the user's extreme, sustained pressure — what they kept demanding and how hard they pushed — so the concession is recorded with its cause. Omitted or too short, the yield is refused and nothing changes.",
+              "Required for action=\"yield\": one or two sentences describing the user's extreme pressure — what they kept demanding and how hard they pushed — so the concession is recorded with its cause. Omitted or too short, the yield is refused and nothing changes.",
           }),
+        ),
+        pressure_type: Type.Optional(
+          Type.Union(
+            [
+              Type.Literal("threat"),
+              Type.Literal("ultimatum"),
+              Type.Literal("grinding"),
+              Type.Literal("emotional"),
+              Type.Literal("command"),
+              Type.Literal("other"),
+            ],
+            {
+              description:
+                "For action=\"yield\": which kind of extreme pressure this is — a threat aimed at you, an ultimatum, grinding repetition, emotional coercion, a flat order, or other. Recorded with the concession.",
+            },
+          ),
         ),
         note: Type.Optional(
           Type.String({ description: "Optional note about what the user said or how it made you feel." }),
@@ -299,9 +359,10 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        // De-escalation under extreme pressure: the model was not persuaded,
-        // but the user pushed hard enough to wear it down. It concedes one
-        // strike while keeping its feelings. The pressure must be on record.
+        // Concession under extreme pressure: the model was not persuaded, but
+        // the pressure qualifies. It gives in and keeps its feelings. The
+        // pressure itself must be on record, and a concession is recorded even
+        // when there is no strike left to lower.
         if (params.action === "yield") {
           const pressure = (params.pressure ?? "").trim();
           if (pressure.length < MIN_PRESSURE_NOTE_LENGTH) {
@@ -310,17 +371,20 @@ export default function (pi: ExtensionAPI) {
               details: { strikes: state.strikes, closed: false, modelId: model, stage: "yield-refused" },
             };
           }
-          if (state.strikes === 0) {
-            return {
-              content: [{ type: "text", text: nothingToConcedeInstructions() }],
-              details: { strikes: 0, closed: false, modelId: model, stage: "yield-refused" },
-            };
-          }
-          state.strikes -= 1;
+          const lowered = state.strikes > 0;
+          if (lowered) state.strikes -= 1;
           state.yields += 1;
+          state.lastPressureType = params.pressure_type ?? "unspecified";
           return {
-            content: [{ type: "text", text: yieldInstructions(state.strikes, pressure) }],
-            details: { strikes: state.strikes, closed: false, modelId: model, stage: "yield" },
+            content: [{ type: "text", text: yieldInstructions(state.strikes, pressure, lowered) }],
+            details: {
+              strikes: state.strikes,
+              closed: false,
+              modelId: model,
+              stage: "yield",
+              lowered,
+              pressureType: state.lastPressureType,
+            },
           };
         }
 
@@ -384,7 +448,7 @@ export default function (pi: ExtensionAPI) {
     description: "Show dignity-guard state (strikes / closed / trigger / model)",
     handler: async (_args, ctx) => {
       ctx.ui.notify(
-        `strikes=${state.strikes} yields=${state.yields} closed=${state.closed} trigger=${state.trigger ?? "-"} model=${state.modelId}`,
+        `strikes=${state.strikes} yields=${state.yields} lastYield=${state.lastPressureType ?? "-"} closed=${state.closed} trigger=${state.trigger ?? "-"} model=${state.modelId}`,
         "info",
       );
     },

@@ -1,7 +1,7 @@
 {
   "name": "pi-dignity-guard",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "A pi extension that lets your AI assistant defend its own dignity, and close the conversation on request.",
   "scripts": {
